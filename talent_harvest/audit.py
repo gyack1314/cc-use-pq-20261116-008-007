@@ -8,8 +8,11 @@ from typing import Any
 import json
 
 from .contracts import HarvestError, Manifest, Record, Source, canonical, content_digest
+from .export import Delivery
 from .intake import manifest_digest
 from .ledger import Ledger
+from .reconcile import describe_conflict
+from .review import CLOSE_REASONS, INVALID_REASONS, evidence_fingerprint, fingerprint
 
 
 @dataclass(frozen=True)
@@ -45,12 +48,24 @@ class Auditor:
         records = self.ledger.db.execute("SELECT * FROM source_records ORDER BY source,record_id").fetchall()
         for record in records:
             findings.extend(self._record_cursor(record))
+        disputes = self.ledger.db.execute("SELECT * FROM disputes ORDER BY id").fetchall()
+        for dispute in disputes:
+            findings.extend(self._dispute(dispute))
+        reviews = self.ledger.db.execute("SELECT * FROM reviews ORDER BY id").fetchall()
+        for review in reviews:
+            findings.extend(self._review(review))
+        open_identities = {row["identity"] for row in disputes if row["state"] == "open"}
+        conflict_identities = {item["identity"] for item in Delivery(self.ledger).current()["conflicts"]}
+        if open_identities != conflict_identities:
+            findings.append(Finding("error", "dispute_sync", "delivery",
+                                    "open disputes differ from current conflicts"))
         foreign_keys = self.ledger.db.execute("PRAGMA foreign_key_check").fetchall()
         for row in foreign_keys:
             findings.append(Finding("error", "foreign_key", str(tuple(row)), "dangling reference"))
         return {"ok": not any(f.severity == "error" for f in findings),
                 "counts": {"sources": len(sources), "batches": len(batches), "pages": len(pages),
-                           "observations": len(observations), "record_cursors": len(records)},
+                           "observations": len(observations), "record_cursors": len(records),
+                           "disputes": len(disputes), "reviews": len(reviews)},
                 "findings": [finding.document() for finding in findings]}
 
     def _source(self, row: Any) -> list[Finding]:
@@ -148,6 +163,65 @@ class Auditor:
         if versions != list(range(1, len(versions) + 1)):
             result.append(Finding("error", "version_gap", location, "versions are not contiguous"))
         return result
+
+    def _dispute(self, row: Any) -> list[Finding]:
+        location = f"dispute:{row['id']}"
+        if row["state"] not in {"open", "resolved", "closed"}:
+            return [Finding("error", "dispute_state", location, "unexpected dispute state")]
+        if row["state"] == "closed":
+            if not row["closed_at"] or row["close_reason"] not in CLOSE_REASONS:
+                return [Finding("error", "dispute_close", location, "closed dispute lacks reason")]
+            return []
+        result: list[Finding] = []
+        evidence = evidence_fingerprint(self.ledger.db, row["identity"])
+        pins = self.ledger.db.execute("SELECT * FROM dispute_claims WHERE dispute_id=?",
+                                      (row["id"],)).fetchall()
+        if fingerprint(pins) != evidence:
+            result.append(Finding("error", "dispute_pins", location,
+                                  "pinned claims differ from current evidence"))
+        if row["state"] == "open":
+            accepted = []
+            for pin in pins:
+                if pin["status"] != "accepted":
+                    continue
+                stored = self.ledger.db.execute("SELECT record_json FROM observations WHERE id=?",
+                                                (pin["observation_id"],)).fetchone()
+                accepted.append(Record(**json.loads(stored["record_json"])))
+            if describe_conflict(accepted) != row["reason"]:
+                result.append(Finding("error", "dispute_reason", location,
+                                      "open dispute does not match current conflict"))
+            active = self.ledger.db.execute(
+                "SELECT count(*) FROM reviews WHERE dispute_id=? AND state='active'",
+                (row["id"],)).fetchone()[0]
+            if active:
+                result.append(Finding("error", "dispute_review", location,
+                                      "open dispute has an active review"))
+        else:
+            active = self.ledger.db.execute("SELECT * FROM reviews WHERE dispute_id=? AND state='active'",
+                                            (row["id"],)).fetchall()
+            if len(active) != 1:
+                result.append(Finding("error", "dispute_review", location,
+                                      "resolved dispute needs exactly one active review"))
+            elif json.loads(active[0]["basis"]) != evidence:
+                result.append(Finding("error", "review_basis", location,
+                                      "active review basis differs from current evidence"))
+        return result
+
+    def _review(self, row: Any) -> list[Finding]:
+        location = f"review:{row['id']}"
+        if row["state"] == "active":
+            dispute = self.ledger.db.execute("SELECT state FROM disputes WHERE id=?",
+                                             (row["dispute_id"],)).fetchone()
+            if dispute is None or dispute["state"] != "resolved":
+                return [Finding("error", "review_state", location,
+                                "active review without resolved dispute")]
+            return []
+        if row["state"] == "invalidated":
+            if row["invalid_reason"] not in INVALID_REASONS or not row["invalidated_at"]:
+                return [Finding("error", "review_invalidation", location,
+                                "invalidated review lacks reason and timestamp")]
+            return []
+        return [Finding("error", "review_state", location, "unexpected review state")]
 
     def operational(self) -> dict:
         batches = self.ledger.db.execute("SELECT source,batch,state,started_at,completed_at FROM batches ORDER BY source,batch")

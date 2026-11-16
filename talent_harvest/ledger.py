@@ -10,6 +10,7 @@ import sqlite3
 
 from .contracts import HarvestError, Manifest, Record, Source, canonical
 from .intake import manifest_digest
+from .review import REVIEW_SCHEMA, sync_identities
 
 
 SCHEMA = """
@@ -55,7 +56,7 @@ CREATE TABLE IF NOT EXISTS events (
  source TEXT, batch TEXT, ordinal INTEGER, payload TEXT NOT NULL,
  occurred_at TEXT NOT NULL
 );
-"""
+""" + REVIEW_SCHEMA
 
 
 def utc_now() -> str:
@@ -185,9 +186,15 @@ class Ledger:
                 return {"ordinal": ordinal, "unchanged": True, "records": row["record_count"]}
             captured = self.db.execute("SELECT captured_at FROM batches WHERE source=? AND batch=?",
                                        (source, batch)).fetchone()[0]
+            affected: set[str] = set()
             for record, raw, status, reasons in items:
-                previous = self.db.execute("SELECT version FROM source_records WHERE source=? AND record_id=?",
+                previous = self.db.execute("SELECT version,latest_observation FROM source_records WHERE source=? AND record_id=?",
                                            (source, record.source_record_id)).fetchone()
+                if previous is not None:
+                    old_identity = self.db.execute("SELECT identity FROM observations WHERE id=?",
+                                                   (previous["latest_observation"],)).fetchone()
+                    if old_identity is not None and old_identity[0] != record.identity:
+                        affected.add(old_identity[0])
                 version = previous[0] + 1 if previous else 1
                 cursor = self.db.execute("INSERT INTO observations(source,batch,ordinal,record_id,identity,record_json,raw_json,raw_digest,status,reasons,version,captured_at,observed_at) VALUES(?,?,?,?,?,?,?,?,?,?,?,?,?)",
                                          (source, batch, ordinal, record.source_record_id, record.identity,
@@ -195,6 +202,7 @@ class Ledger:
                                           status, canonical(reasons), version, captured, utc_now()))
                 self.db.execute("INSERT INTO source_records(source,record_id,version,latest_observation) VALUES(?,?,?,?) ON CONFLICT(source,record_id) DO UPDATE SET version=excluded.version,latest_observation=excluded.latest_observation",
                                 (source, record.source_record_id, version, cursor.lastrowid))
+                affected.add(record.identity)
             self.db.execute("UPDATE pages SET state='complete',attempts=attempts+1,error_code=NULL,error_detail=NULL,processed_at=?,record_count=? WHERE source=? AND batch=? AND ordinal=?",
                             (utc_now(), len(items), source, batch, ordinal))
             self.event("page_committed", source, batch, ordinal, {"records": len(items)})
@@ -209,6 +217,7 @@ class Ledger:
                                          (source, batch)).fetchone()[0]
                 self.db.execute("UPDATE batches SET state=? WHERE source=? AND batch=?",
                                 ("failed" if failed else "pending", source, batch))
+            sync_identities(self.db, affected)
             return {"ordinal": ordinal, "unchanged": False, "records": len(items)}
 
     def withdraw(self, source: str, reason: str) -> dict:
@@ -221,6 +230,11 @@ class Ledger:
             at = utc_now()
             self.db.execute("UPDATE sources SET withdrawn_at=? WHERE key=?", (at, source))
             self.event("source_withdrawn", source, None, None, {"reason": reason})
+            identities = [row[0] for row in self.db.execute(
+                "SELECT DISTINCT o.identity FROM observations o"
+                " JOIN source_records sr ON sr.latest_observation=o.id WHERE o.source=?",
+                (source,)).fetchall()]
+            sync_identities(self.db, identities)
             return {"source": source, "withdrawn_at": at, "unchanged": False}
 
     def observations(self, *, source: str | None = None, identity: str | None = None) -> list[dict]:

@@ -16,6 +16,7 @@ from .analytics import Analytics
 from .export import Delivery, verify_snapshot
 from .ledger import Ledger
 from .pipeline import Harvester
+from .review import ReviewBoard
 
 
 def parser() -> ArgumentParser:
@@ -84,6 +85,18 @@ def parser() -> ArgumentParser:
     actions.add_parser("trend", help="summarize capture months")
     actions.add_parser("conflicts", help="summarize active disputes")
     actions.add_parser("health", help="show delivery readiness")
+    disputes = actions.add_parser("disputes", help="list dispute candidates with pinned claims")
+    disputes.add_argument("--all", action="store_true", help="include closed disputes")
+    review_cmd = actions.add_parser("review", help="submit a review decision for an open dispute")
+    review_cmd.add_argument("identity")
+    review_cmd.add_argument("--reviewer", required=True)
+    review_cmd.add_argument("--select", required=True, help="claim to adopt: source/record_id/version")
+    review_cmd.add_argument("--challenge", required=True, help="claim to challenge: source/record_id/version")
+    review_cmd.add_argument("--basis", nargs="+", required=True,
+                            help="evidence versions the decision is based on")
+    review_cmd.add_argument("--note", default="")
+    reviews = actions.add_parser("reviews", help="show review decisions and invalidation reasons")
+    reviews.add_argument("--identity")
     events = actions.add_parser("events", help="show event history")
     events.add_argument("--source")
     snapshot = actions.add_parser("snapshot", help="write delivery snapshot")
@@ -171,6 +184,13 @@ def execute(args: Namespace) -> dict:
             return Analytics(ledger).trend()
         if args.action == "conflicts":
             return Analytics(ledger).conflict_report()
+        if args.action == "disputes":
+            return ReviewBoard(ledger).disputes(include_closed=args.all)
+        if args.action == "review":
+            return ReviewBoard(ledger).submit(args.identity, args.reviewer, args.select,
+                                              args.challenge, args.basis, note=args.note)
+        if args.action == "reviews":
+            return ReviewBoard(ledger).reviews(identity=args.identity)
         if args.action == "health":
             return Analytics(ledger).delivery_health()
         if args.action == "events":

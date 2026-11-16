@@ -27,12 +27,17 @@ ingest 对失败页返回非零退出码，并将原因保存在数据库。修�
 
 每条记录需要 record_id、organization、title、region、discipline、quantity、published_at（YYYY-MM-DD）；reference 与 description 可选。数量为非负整数，零数量、未来发布日期、低可信来源和缺少明确引用的合作项目会被隔离。基础实体键由类别、机构、标题和地区确定；相同实体的不同来源若数量、学科或发布日期不一致，会列入争议而非当前可用数据。实体键是精确规范化后的匹配，不做模糊别名判断。
 
+## 争议审核
+
+争议在证据变化的事务内同步维护：形成争议时固定参与声明的记录版本、页摘要与质量状态（disputes）。审核员用 review IDENTITY --reviewer NAME --select S/R/V --challenge S/R/V --basis S/R/V... 提交决定，提交在同一事务内原子比较 --basis 与当前证据版本：版本已变化返回 review_stale，已有生效决定返回 review_conflict。决定生效后实体从待审争议转为有效选择（current 中带 resolution），被质疑版本的声明退出可用证据，但来源不被封禁，其新页版本重新接受自动质量判断。证据变化（新批次、页级重试）或来源撤回会使生效决定失效，reviews 与事件以 evidence_changed 或 source_withdrawn 说明失效原因；争议随之回到待审，或在声明一致、参与方撤回时正常归并（dispute 关闭原因为 merged 或 source_withdrawn）。
+
 ## 查询与运维
 
 - current --quarantine 返回有效实体、争议与隔离记录；默认不附带隔离明细。
 - history、trace IDENTITY、record SOURCE ID、timeline SOURCE、batch-evidence SOURCE BATCH 追踪来源与修订。
 - status SOURCE BATCH、operations、recovery、quality、audit 检查页级恢复和数据状态。
 - summary、distribution、coverage、age YYYY-MM-DD、trend 和 conflicts 提供当前与历史摘要。
+- disputes 列出待审与已决争议及固定声明（--all 含已关闭）；review 提交审核决定；reviews 展示决定状态与失效原因。
 - snapshot FILE 写出当前视图与摘要；verify FILE SHA256 校验交付字节。
 - preview SOURCE_JSON MANIFEST 在不登记批次的情况下检查本地文件；replay-check MANIFEST 对已完成批次复核原始镜像；checkpoint 读取游标快照。
 

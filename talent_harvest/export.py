@@ -10,6 +10,7 @@ import json
 from .contracts import HarvestError, canonical
 from .ledger import Ledger
 from .reconcile import reconcile_group
+from .review import active_marks, active_resolutions
 
 
 def _latest_per_source(rows: list[dict]) -> list[dict]:
@@ -36,6 +37,10 @@ class Delivery:
 
     def current(self, *, include_quarantine: bool = False) -> dict:
         rows = [row for row in _latest_per_source(self.ledger.observations()) if not row["withdrawn_at"]]
+        marks = active_marks(self.ledger.db)
+        resolutions = active_resolutions(self.ledger.db)
+        open_disputes = {row["identity"]: row for row in self.ledger.db.execute(
+            "SELECT id,identity,revision FROM disputes WHERE state='open'").fetchall()}
         groups: dict[str, list[dict]] = defaultdict(list)
         for row in rows:
             groups[row["identity"]].append(row)
@@ -47,15 +52,44 @@ class Delivery:
             rejected = [row for row in group if row["status"] != "accepted"]
             if include_quarantine:
                 quarantined.extend(_project(row) for row in rejected)
-            status, reason, winner = reconcile_group(group)
+            usable = [row for row in group
+                      if (row["source"], row["record_id"], row["version"]) not in marks]
+            resolution = resolutions.get(identity)
+            if resolution is not None:
+                selected = next((row for row in usable
+                                 if row["source"] == resolution["selected_source"]
+                                 and row["record_id"] == resolution["selected_record_id"]
+                                 and row["version"] == resolution["selected_version"]
+                                 and row["status"] == "accepted"), None)
+                if selected is not None:
+                    accepted.append({"identity": identity, "record": selected["record"],
+                                     "selected": _project(selected),
+                                     "evidence": [_project(item) for item in
+                                                  sorted(usable, key=lambda x: (x["source"], x["record_id"]))
+                                                  if item["status"] == "accepted"],
+                                     "resolution": {"review_id": resolution["id"],
+                                                    "reviewer": resolution["reviewer"],
+                                                    "note": resolution["note"],
+                                                    "submitted_at": resolution["submitted_at"],
+                                                    "challenged": {
+                                                        "source": resolution["challenged_source"],
+                                                        "record_id": resolution["challenged_record_id"],
+                                                        "version": resolution["challenged_version"]}}})
+                    continue
+            status, reason, winner = reconcile_group(usable)
             if status == "accepted" and winner:
                 accepted.append({"identity": identity, "record": winner["record"],
                                  "selected": _project(winner),
-                                 "evidence": [_project(item) for item in sorted(group, key=lambda x: (x["source"], x["record_id"]))
+                                 "evidence": [_project(item) for item in sorted(usable, key=lambda x: (x["source"], x["record_id"]))
                                               if item["status"] == "accepted"]})
             elif status == "conflict":
-                conflicts.append({"identity": identity, "reason": reason,
-                                  "evidence": [_project(item) for item in group if item["status"] == "accepted"]})
+                entry = {"identity": identity, "reason": reason,
+                         "evidence": [_project(item) for item in usable if item["status"] == "accepted"]}
+                dispute = open_disputes.get(identity)
+                if dispute is not None:
+                    entry["dispute_id"] = dispute["id"]
+                    entry["revision"] = dispute["revision"]
+                conflicts.append(entry)
         return {"schema_version": 1, "accepted": accepted, "conflicts": conflicts,
                 "quarantined": quarantined if include_quarantine else [],
                 "counts": {"accepted": len(accepted), "conflicts": len(conflicts),
